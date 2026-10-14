@@ -1,5 +1,9 @@
 import copy
 from decimal import Decimal
+from datetime import timedelta
+import inspect
+from types import SimpleNamespace
+from apify_client import ApifyClient
 import json
 from pathlib import Path
 import tempfile
@@ -7,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 import pdfkit_compat as pdfkit
+
+SDK_CALL_SIGNATURE = inspect.signature(type(ApifyClient("offline-fixture-not-a-token").actor("fixture")).call)
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 EXPORT = json.loads((FIXTURES / 'board-run.json').read_text())['run']
@@ -30,6 +36,7 @@ class FakeClient:
         return self
 
     def call(self, **kwargs):
+        SDK_CALL_SIGNATURE.bind(self, **kwargs)  # Reject every unknown SDK kwarg.
         self.calls.append(kwargs)
         return {'status': self.status, 'defaultDatasetId': 'fixture-dataset', 'defaultKeyValueStoreId': 'fixture-store'}
 
@@ -47,6 +54,9 @@ class FakeClient:
     def get_record(self, key):
         self.reads.append(('key', key))
         return {'value': self.blob}
+
+
+FakeClient.call.__signature__ = SDK_CALL_SIGNATURE
 
 
 class ContractTests(unittest.TestCase):
@@ -70,7 +80,11 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(sent['run_input'][key], EXPORT['input'][key])
         self.assertEqual(sent['run_input']['margin'], dict.fromkeys(('top', 'right', 'bottom', 'left'), '0.5in'))
         self.assertEqual(sent['max_total_charge_usd'], Decimal('1.0'))
-        self.assertEqual((sent['memory_mbytes'], sent['timeout_secs'], sent['wait_secs']), (1024, 300, 330))
+        self.assertEqual(sent['memory_mbytes'], 1024)
+        if 'run_timeout' in SDK_CALL_SIGNATURE.parameters:
+            self.assertEqual((sent['run_timeout'], sent['wait_duration']), (timedelta(seconds=300), timedelta(seconds=330)))
+        else:
+            self.assertEqual((sent['timeout_secs'], sent['wait_secs']), (300, 330))
         self.assertEqual(fake.actor_id, pdfkit.ACTOR_ID)
         self.assertIn(('key', HTML_ROW['imageKey']), fake.reads)
 
@@ -182,16 +196,58 @@ class ContractTests(unittest.TestCase):
                 pdfkit.from_string('hello', Path(d) / 'missing' / 'out.pdf', client=fake)
             self.assertEqual(fake.calls, [])
 
-    def test_sdk_get_record_returns_binary(self):
-        # No HTTP: exercise the installed SDK on an HTTP response containing
-        # the actual board invoice PDF, not our own FakeClient implementation.
-        try:
-            from apify_client import ApifyClient
-            import httpx
-        except ImportError:
-            self.skipTest('Optional apify-client dependency not installed')
+    def test_fake_rejects_unknown_sdk_kwargs(self):
+        with self.assertRaises(TypeError):
+            FakeClient().call(not_a_real_sdk_option=True)
+
+    def test_real_sdk_call_reaches_http_transport(self):
+        # Real ActorClient.call/start; only HTTP is replaced, never the signature.
         sdk = ApifyClient('offline-fixture-not-a-token')
-        response = httpx.Response(200, content=BLOB, headers={'content-type': 'application/pdf'})
+        with patch.object(sdk.http_client, 'call', side_effect=RuntimeError('HTTP boundary')) as http:
+            with self.assertRaisesRegex(RuntimeError, 'HTTP boundary'):
+                pdfkit.from_string('<h1>x</h1>', False, {'page-size': 'Letter'}, client=sdk)
+        self.assertEqual(http.call_count, 1)
+        self.assertEqual(http.call_args.kwargs['method'], 'POST')
+        self.assertEqual(http.call_args.kwargs['params']['timeout'], 300)
+        self.assertEqual(http.call_args.kwargs['params']['memory'], 1024)
+
+    def test_real_sdk_output_path(self):
+        # Synthetic run metadata; real board row/PDF. No cloud-success claim.
+        sdk = ApifyClient('offline-fixture-not-a-token')
+        actor_type = type(sdk.actor('fixture'))
+        run_type = type(sdk.run('fixture'))
+        run = {'id': 'fixture-run', 'status': 'SUCCEEDED',
+               'defaultDatasetId': 'fixture-dataset', 'defaultKeyValueStoreId': 'fixture-store'}
+        if 'run_timeout' in SDK_CALL_SIGNATURE.parameters:
+            model = inspect.unwrap(run_type.wait_for_finish).__globals__['Run']
+            run = model.model_construct(id='fixture-run', status='SUCCEEDED',
+                                      default_dataset_id='fixture-dataset',
+                                      default_key_value_store_id='fixture-store')
+        headers = {'x-apify-pagination-total': '1', 'x-apify-pagination-offset': '0',
+                   'x-apify-pagination-count': '1', 'x-apify-pagination-limit': '1000',
+                   'x-apify-pagination-desc': 'false'}
+        page = SimpleNamespace(status_code=200, headers=headers, json=lambda: [HTML_ROW])
+        pdf = SimpleNamespace(status_code=200, content=BLOB, headers={'content-type': 'application/pdf'})
+        def respond(**kwargs):
+            if kwargs['url'].endswith('/items'):
+                if kwargs['params'].get('offset', 0) == 0:
+                    return page
+                return SimpleNamespace(status_code=200, headers=dict(headers, **{'x-apify-pagination-count': '0', 'x-apify-pagination-offset': '1'}), json=lambda: [])
+            return pdf
+        with patch.object(actor_type, 'start', return_value=run), \
+             patch.object(run_type, 'wait_for_finish', return_value=run) as wait, \
+             patch.object(sdk.http_client, 'call', side_effect=respond) as http:
+            self.assertEqual(pdfkit.from_string('hello', client=sdk), BLOB)
+        self.assertEqual(http.call_count, 3 if 'run_timeout' in SDK_CALL_SIGNATURE.parameters else 2)
+        timing = wait.call_args.kwargs
+        if 'run_timeout' in SDK_CALL_SIGNATURE.parameters:
+            self.assertEqual(timing['wait_duration'], timedelta(seconds=330))
+        else:
+            self.assertEqual(timing['wait_secs'], 330)
+
+    def test_sdk_get_record_returns_binary(self):
+        sdk = ApifyClient('offline-fixture-not-a-token')
+        response = SimpleNamespace(status_code=200, content=BLOB, headers={'content-type': 'application/pdf'})
         with patch.object(sdk.http_client, 'call', return_value=response):
             record = sdk.key_value_store('fixture-store').get_record(HTML_ROW['imageKey'])
         self.assertEqual(record['value'], BLOB)

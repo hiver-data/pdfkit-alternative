@@ -5,6 +5,8 @@ Not an official pdfkit package or a local wkhtmltopdf replacement. Import swap:
 No network request is made on import. Unsupported options fail before billing.
 """
 from decimal import Decimal, InvalidOperation
+from datetime import timedelta
+from inspect import signature
 import os
 from pathlib import Path
 import re
@@ -90,8 +92,15 @@ def _convert(source, value, output_path, options, *, token, client, max_total_ch
         from apify_client import ApifyClient
         client = ApifyClient(token)
     # One call only: failed/unfinished runs are never retried as new billed runs.
-    run = client.actor(ACTOR_ID).call(run_input=inp, max_total_charge_usd=cap,
-                                     memory_mbytes=1024, timeout_secs=300, wait_secs=330)
+    actor = client.actor(ACTOR_ID)
+    if "run_timeout" in signature(actor.call).parameters:
+        timing = {"run_timeout": timedelta(seconds=300), "wait_duration": timedelta(seconds=330)}
+    else:
+        timing = {"timeout_secs": 300, "wait_secs": 330}
+    run = actor.call(run_input=inp, max_total_charge_usd=cap,
+                     memory_mbytes=1024, logger=None, **timing)
+    if run is not None and hasattr(run, "model_dump"):
+        run = run.model_dump(by_alias=True)
     if not run or run.get("status") != "SUCCEEDED":
         status = (run or {}).get("status", "missing response")
         raise PDFKitError("Actor run did not succeed: " + str(status) + "; inspect it before starting another run")

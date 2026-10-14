@@ -120,8 +120,18 @@ input/rows and the actual first HTML PDF. The URL-success transport test
 explicitly substitutes that small invoice PDF for a download; it is not the
 cloud Cat PDF. The exact Cat row separately tests detection of truncated output.
 The four full cloud PDFs were independently downloaded and checked in the
-issue's cloud gate. If `apify-client` is installed, one extra test exercises its
-binary-record deserializer with a mocked HTTP response holding the real PDF.
+issue's cloud gate. Install requirements before running the 21 tests: they
+exercise the installed SDK's real ActorClient.call signature, dataset pagination
+and binary-record deserializer without HTTP. The fake client also rejects unknown
+SDK keywords. Synthetic run metadata is labelled in the test; the row and PDF
+come from the board export.
+
+Both apify-client 3.3.0 and 2.5.1 were checked in fresh virtual environments on
+2026-10-14: `pip install -r requirements.txt apify-client==VERSION`, all 21 tests
+passed with no skips, and a fake-token `from_string('<h1>x</h1>', False,
+{'page-size': 'Letter'})` reached Apify's HTTP 401 authentication error (no
+TypeError, no billed run). The shim uses timedelta timeouts and normalizes the
+Run model on 3.x; 2.x uses seconds and a dictionary. Requirements allow >=2.5,<4.
 
 This module is MIT licensed. Fixtures document our own board run; no pdfkit
 source code is copied. No affiliation with pdfkit or wkhtmltopdf.
